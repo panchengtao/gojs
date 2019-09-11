@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -27,7 +28,7 @@ var (
 	nativefunction C.JSClassRef
 	nativeobject   C.JSClassRef
 	nativemethod   C.JSClassRef
-	objects        map[int64]*object_data
+	objects        sync.Map
 	uid            int64
 )
 
@@ -61,7 +62,7 @@ func init() {
 	}
 
 	// Create map for native objects
-	objects = make(map[int64]*object_data)
+	objects = sync.Map{}
 }
 
 // Given a slice of go-style Values, this function allocates a new array of c-style values and returns a pointer to the first element in the array, along with the length of the array.
@@ -245,7 +246,7 @@ func setNativeFieldFromJSValue(field reflect.Value, ctx *Context, value *Value) 
 func register(data *object_data) int64 {
 	id := atomic.AddInt64(&uid, 1)
 	data.uid = &id
-	objects[id] = data
+	objects.Store(id, data)
 	return id
 }
 
@@ -253,7 +254,7 @@ func register(data *object_data) int64 {
 func finalize_go(data unsafe.Pointer) {
 	// Called from JavaScriptCore finalizer methods
 	id := *(*int64)(data)
-	delete(objects, id)
+	objects.Delete(id)
 }
 
 //=========================================================
@@ -277,23 +278,26 @@ func (ctx *Context) NewFunctionWithCallback(callback GoFunctionCallback) *Object
 //export nativecallback_CallAsFunction_go
 func nativecallback_CallAsFunction_go(data_ptr unsafe.Pointer, rawCtx C.JSContextRef, function C.JSObjectRef, thisObject C.JSObjectRef, argumentCount uint, arguments unsafe.Pointer, exception *C.JSValueRef) unsafe.Pointer {
 	ctx := NewContextFrom(RawContext(rawCtx))
-	//defer func() {
-	//	if r := recover(); r != nil {
-	//		*exception = panicArgToJSString(ctx, r).ref
-	//	}
-	//}()
-
-	data := objects[*(*int64)(data_ptr)]
-	ret, err := data.val.Interface().(GoFunctionCallback)(
-		ctx, ctx.newObject(function), ctx.newObject(thisObject), ctx.newGoValueArray(arguments, argumentCount) /*(*[1 << 14]*Value)(arguments)[0:argumentCount]*/)
-	if err != nil {
-		*exception = ctx.NewStringValue(err.Error()).ref
-		return nil
+	defer func() {
+		if r := recover(); r != nil {
+			*exception = panicArgToJSString(ctx, r).ref
+		}
+	}()
+	if data, ok := objects.Load(*(*int64)(data_ptr)); !ok {
+		panic("Could not load data_ptr from the global object_map")
+	} else {
+		objdata := data.(*object_data)
+		ret, err := objdata.val.Interface().(GoFunctionCallback)(
+			ctx, ctx.newObject(function), ctx.newObject(thisObject), ctx.newGoValueArray(arguments, argumentCount) /*(*[1 << 14]*Value)(arguments)[0:argumentCount]*/)
+		if err != nil {
+			*exception = ctx.NewStringValue(err.Error()).ref
+			return nil
+		}
+		if ret == nil {
+			return unsafe.Pointer(nil)
+		}
+		return unsafe.Pointer(ret.ref)
 	}
-	if ret == nil {
-		return unsafe.Pointer(nil)
-	}
-	return unsafe.Pointer(ret.ref)
 }
 
 //=========================================================
@@ -353,22 +357,26 @@ func nativefunction_CallAsFunction_go(data_ptr unsafe.Pointer, rawCtx C.JSContex
 	}()
 
 	// recover the object
-	data := objects[*(*int64)(data_ptr)]
-	typ := data.typ
-	val := data.val
+	if data, ok := objects.Load(*(*int64)(data_ptr)); !ok {
+		panic("Could not load data_ptr from the global object_map")
+	} else {
+		objdata := data.(*object_data)
+		typ := objdata.typ
+		val := objdata.val
 
-	// Do the number of input parameters match?
-	if typ.NumIn() != int(argumentCount) {
-		panic("Incorrect number of function arguments")
+		// Do the number of input parameters match?
+		if typ.NumIn() != int(argumentCount) {
+			panic("Incorrect number of function arguments")
+		}
+
+		//log.Println("About to docall()!")
+
+		ret := docall(ctx, val, argumentCount, arguments)
+		if ret == nil {
+			return nil
+		}
+		return unsafe.Pointer(ret.ref)
 	}
-
-	//log.Println("About to docall()!")
-
-	ret := docall(ctx, val, argumentCount, arguments)
-	if ret == nil {
-		return nil
-	}
-	return unsafe.Pointer(ret.ref)
 }
 
 //=========================================================
@@ -396,35 +404,39 @@ func nativeobject_GetProperty_go(data_ptr, uctx, _, propertyName unsafe.Pointer,
 	name := (*String)(propertyName).String()
 
 	// Reconstruct the object interface
-	data := objects[*(*int64)(data_ptr)]
+	// recover the object
+	if data, ok := objects.Load(*(*int64)(data_ptr)); !ok {
+		panic("Could not load data_ptr from the global object_map")
+	} else {
+		objdata := data.(*object_data)
+		// Drill down through reflect to find the property
+		val := objdata.val
+		if ptrvalue := val; ptrvalue.Kind() == reflect.Ptr {
+			val = ptrvalue.Elem()
+		}
+		struct_val := val
+		if struct_val.Kind() != reflect.Struct {
+			return nil
+		}
 
-	// Drill down through reflect to find the property
-	val := data.val
-	if ptrvalue := val; ptrvalue.Kind() == reflect.Ptr {
-		val = ptrvalue.Elem()
-	}
-	struct_val := val
-	if struct_val.Kind() != reflect.Struct {
+		// Can we locate a field with the proper name?
+		field := struct_val.FieldByName(name)
+		if field.IsValid() {
+			return unsafe.Pointer(ctx.reflectToJSValue(field).ref)
+		}
+
+		// Can we locate a method with the proper name?
+		typ := objdata.typ
+		for lp := 0; lp < typ.NumMethod(); lp++ {
+			if typ.Method(lp).Name == name {
+				ret := newNativeMethod(ctx, objdata, lp)
+				return unsafe.Pointer(ret.ref)
+			}
+		}
+
+		// No matches found
 		return nil
 	}
-
-	// Can we locate a field with the proper name?
-	field := struct_val.FieldByName(name)
-	if field.IsValid() {
-		return unsafe.Pointer(ctx.reflectToJSValue(field).ref)
-	}
-
-	// Can we locate a method with the proper name?
-	typ := data.typ
-	for lp := 0; lp < typ.NumMethod(); lp++ {
-		if typ.Method(lp).Name == name {
-			ret := newNativeMethod(ctx, data, lp)
-			return unsafe.Pointer(ret.ref)
-		}
-	}
-
-	// No matches found
-	return nil
 }
 
 //export nativeobject_SetProperty_go
@@ -434,45 +446,53 @@ func nativeobject_SetProperty_go(data_ptr unsafe.Pointer, rawCtx C.JSContextRef,
 	name := newStringFromRef(propertyName).String()
 
 	// Reconstruct the object interface
-	data := objects[*(*int64)(data_ptr)]
+	if data, ok := objects.Load(*(*int64)(data_ptr)); !ok {
+		panic("Could not load data_ptr from the global object_map")
+	} else {
+		objdata := data.(*object_data)
 
-	// Drill down through reflect to find the property
-	val := data.val
-	if ptrvalue := val; ptrvalue.Kind() == reflect.Ptr {
-		val = ptrvalue.Elem()
-	}
-	struct_val := val
-	if struct_val.Kind() != reflect.Struct {
-		*exception = ctx.newErrorOrPanic("object is not a Go struct")
-		return 0
-	}
+		// Drill down through reflect to find the property
+		val := objdata.val
+		if ptrvalue := val; ptrvalue.Kind() == reflect.Ptr {
+			val = ptrvalue.Elem()
+		}
+		struct_val := val
+		if struct_val.Kind() != reflect.Struct {
+			*exception = ctx.newErrorOrPanic("object is not a Go struct")
+			return 0
+		}
 
-	field := struct_val.FieldByName(name)
-	if !field.IsValid() {
-		return 0
-	}
+		field := struct_val.FieldByName(name)
+		if !field.IsValid() {
+			return 0
+		}
 
-	err := setNativeFieldFromJSValue(field, ctx, ctx.newValue(C.JSValueRef(value)))
-	if err != nil {
-		*exception = ctx.newErrorOrPanic(err.Error())
-		return 0
+		err := setNativeFieldFromJSValue(field, ctx, ctx.newValue(C.JSValueRef(value)))
+		if err != nil {
+			*exception = ctx.newErrorOrPanic(err.Error())
+			return 0
+		}
+		return 1
 	}
-	return 1
 }
 
 //export nativeobject_ConvertToString_go
 func nativeobject_ConvertToString_go(data_ptr, ctx, obj unsafe.Pointer) unsafe.Pointer {
 	// Reconstruct the object interface
-	data := objects[*(*int64)(data_ptr)]
+	if data, ok := objects.Load(*(*int64)(data_ptr)); !ok {
+		panic("Could not load data_ptr from the global object_map")
+	} else {
+		objdata := data.(*object_data)
 
-	// Can we get a string?
-	if stringer, ok := data.val.Interface().(Stringer); ok {
-		str := stringer.String()
-		ret := NewString(str)
-		return unsafe.Pointer(ret)
+		// Can we get a string?
+		if stringer, ok := objdata.val.Interface().(Stringer); ok {
+			str := stringer.String()
+			ret := NewString(str)
+			return unsafe.Pointer(ret)
+		}
+
+		return nil
 	}
-
-	return nil
 }
 
 //=========================================================
@@ -500,17 +520,21 @@ func nativemethod_CallAsFunction_go(data_ptr unsafe.Pointer, rawCtx C.JSContextR
 	}()
 
 	// Reconstruct the object interface
-	data := objects[*(*int64)(data_ptr)]
+	if data, ok := objects.Load(*(*int64)(data_ptr)); !ok {
+		panic("Could not load data_ptr from the global object_map")
+	} else {
+		objdata := data.(*object_data)
 
-	// Get the method
-	method := data.val.Method(data.method)
+		// Get the method
+		method := objdata.val.Method(objdata.method)
 
-	// Do the number of input parameters match?
-	if method.Type().NumIn() != int(argumentCount) {
-		panic(fmt.Sprintf("Incorrect number of function arguments! Got %d, expected %d!", method.Type().NumIn(), int(argumentCount)))
+		// Do the number of input parameters match?
+		if method.Type().NumIn() != int(argumentCount) {
+			panic(fmt.Sprintf("Incorrect number of function arguments! Got %d, expected %d!", method.Type().NumIn(), int(argumentCount)))
+		}
+
+		// Perform the call
+		ret := docall(ctx, method, argumentCount, arguments)
+		return unsafe.Pointer(ret.ref)
 	}
-
-	// Perform the call
-	ret := docall(ctx, method, argumentCount, arguments)
-	return unsafe.Pointer(ret.ref)
 }
