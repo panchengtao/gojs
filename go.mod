@@ -1,4 +1,4 @@
-module github.com/wddpct/gojs
+module github.com/percentor/gojs
 
 go 1.13
 
