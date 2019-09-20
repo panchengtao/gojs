@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/crazy2be/gojs"
 	"fmt"
+	"github.com/percentor/gojs"
 )
 
 const source_url = "./test.js"
@@ -54,9 +54,9 @@ func print_result(ctx *gojs.Context, script string) {
 	}
 }
 
-func callback(ctx *gojs.Context, obj *gojs.Object, thisObject *gojs.Object, arguments []*gojs.Value) *gojs.Value {
+func callback(ctx *gojs.Context, obj *gojs.Object, thisObject *gojs.Object, arguments []*gojs.Value) (ret *gojs.Value, err error) {
 	fmt.Printf("In callback!\n")
-	return nil
+	return nil, nil
 }
 
 func main() {
@@ -71,7 +71,7 @@ func main() {
 	obj := ctx.NewFunctionWithCallback(gojs.GoFunctionCallback(callback))
 	ctx.GlobalObject().SetProperty("f", obj.ToValue(), gojs.PropertyAttributeReadOnly)
 	_, err := ctx.EvaluateScript("f()", nil, "", 1)
-	if err!=nil {
+	if err != nil {
 		panic(err)
 	}
 
