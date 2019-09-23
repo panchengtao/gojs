@@ -1,4 +1,2 @@
-github.com/crazy2be/gojs v0.0.0-20141216145018-5392714629fc h1:aYjJJGqeoeEzj5Zb+CABlT7nhBj5sPnZsmERrEX4IMY=
-github.com/crazy2be/gojs v0.0.0-20141216145018-5392714629fc/go.mod h1:/WJ2ANffaRdbu9iQJSW94gldjn3aSj4KFd+QfMx93MU=
 github.com/pkg/errors v0.8.1 h1:iURUrRGxPUNPdy5/HRSm+Yj6okJ6UtLINN0Q9M4+h3I=
 github.com/pkg/errors v0.8.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
